@@ -1,0 +1,2240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="${MIHOMO_HOME:-$HOME/.config/mihomo}"
+PROVIDERS_DIR="$BASE_DIR/providers"
+STATE_FILE="$BASE_DIR/mhswitch-state.json"
+CONFIG_FILE="$BASE_DIR/config.yaml"
+CONTROLLER="${MIHOMO_CONTROLLER:-http://127.0.0.1:9090}"
+SECRET="${MIHOMO_SECRET:-}"
+MIHOMO_BIN="${MIHOMO_BIN:-}"
+PID_FILE="$BASE_DIR/mihomo.pid"
+MIHOMO_INSTALL_DIR="${MHSWITCH_MIHOMO_INSTALL_DIR:-$HOME/.local/bin}"
+MIHOMO_RELEASE_LATEST_URL="${MHSWITCH_MIHOMO_RELEASE_LATEST_URL:-https://github.com/MetaCubeX/mihomo/releases/latest}"
+MIHOMO_RELEASE_BASE_URL="${MHSWITCH_MIHOMO_RELEASE_BASE_URL:-https://github.com/MetaCubeX/mihomo/releases/download}"
+
+# ----------------- AI 地区固定策略 -----------------
+# 默认：OpenAI / Claude / Codex 只在美国节点里故障切换。
+# 与 url-test 不同，fallback 不会因为延迟更低而主动切换；只有当前节点 timeout / 不可用才切换。
+# 你可以通过环境变量覆盖，例如：
+#   export MHSWITCH_AI_REGION_NAME="日本"
+#   export MHSWITCH_AI_REGION_FILTER='(?i)(🇯🇵|日本|JP|Japan|Tokyo|Osaka)'
+AI_REGION_NAME="${MHSWITCH_AI_REGION_NAME:-美国}"
+AI_REGION_FILTER="${MHSWITCH_AI_REGION_FILTER:-(?i)(🇺🇸|美国|US|United States|America|USA)}"
+
+# OpenAI / ChatGPT 健康检查地址：
+# - 默认使用 chatgpt.com/cdn-cgi/trace，优点是轻量、无需登录、能真实检测 ChatGPT 域名可达性；
+# - 这不是 OpenAI API 权限检测，只表示该节点能连通 ChatGPT/OpenAI 相关域名。
+OPENAI_TEST_URL="${MHSWITCH_OPENAI_TEST_URL:-https://chatgpt.com/cdn-cgi/trace}"
+OPENAI_TEST_TIMEOUT_DEFAULT="${MHSWITCH_OPENAI_TEST_TIMEOUT:-10000}"
+CLAUDE_TEST_URL="${MHSWITCH_CLAUDE_TEST_URL:-https://claude.ai}"
+
+# AI 节点额外排除规则：默认排除日志里容易卡住的 DRT/MIX 类节点。
+# 如需关闭排除：export MHSWITCH_AI_EXCLUDE_FILTER=''
+AI_EXCLUDE_FILTER="${MHSWITCH_AI_EXCLUDE_FILTER-[Dd][Rr][Tt]|[Mm][Ii][Xx]}"
+OPENAI_AUTO_GROUP="OpenAI-可用优先"
+OPENAI_GLOBAL_GROUP="OpenAI-全地区-最优"
+
+# 延迟检测默认参数，可通过环境变量覆盖：
+#   MHSWITCH_DELAY_URL="https://www.gstatic.com/generate_204"
+#   MHSWITCH_DELAY_TIMEOUT=5000
+#   MHSWITCH_DELAY_JOBS=12
+DELAY_URL_DEFAULT="${MHSWITCH_DELAY_URL:-https://www.gstatic.com/generate_204}"
+DELAY_TIMEOUT_DEFAULT="${MHSWITCH_DELAY_TIMEOUT:-5000}"
+DELAY_JOBS_DEFAULT="${MHSWITCH_DELAY_JOBS:-12}"
+
+# ----------------- 节点故障切换策略 -----------------
+# 目标：定时健康检查，但只有 timeout / 不可用时才切换；
+# 不因为“延迟更低”或“当前延迟偏高”主动切换。
+#
+# 可通过环境变量覆盖：
+#   MHSWITCH_FAILOVER_INTERVAL=300
+#   MHSWITCH_FAILOVER_TIMEOUT=5000
+#   MHSWITCH_FAILOVER_LAZY=false
+FAILOVER_INTERVAL_DEFAULT="${MHSWITCH_FAILOVER_INTERVAL:-300}"
+FAILOVER_TIMEOUT_DEFAULT="${MHSWITCH_FAILOVER_TIMEOUT:-5000}"
+FAILOVER_LAZY_DEFAULT="${MHSWITCH_FAILOVER_LAZY:-false}"
+
+# ----------------- Git Clone 代理策略 -----------------
+# 默认：git clone 直连，避免拉取代码时被代理影响。
+# 可通过环境变量覆盖：
+#   export MHSWITCH_GIT_PROXY_DEFAULT="proxy"   # direct / proxy / best，也可填具体策略组名
+#   export MHSWITCH_GIT_GROUP_NAME="Git Clone"  # 自定义策略组名
+GIT_GROUP_NAME="${MHSWITCH_GIT_GROUP_NAME:-Git Clone}"
+GIT_PROXY_DEFAULT="${MHSWITCH_GIT_PROXY_DEFAULT:-direct}"
+
+# ----------------- UI Helper -----------------
+if [[ -n "${MHSWITCH_NO_EMOJI:-}" ]]; then
+  I_OK="OK"; I_WARN="!!"; I_ERR="XX"; I_INFO="--"; I_RUN=">>"
+else
+  I_OK="✅"; I_WARN="⚠️"; I_ERR="❌"; I_INFO="ℹ️"; I_RUN="▶️"
+fi
+
+ui_title() { echo "╭──────────────── $1 ────────────────╮"; }
+ui_end() { echo "╰────────────────────────────────────╯"; }
+ui_line() { echo "──────────────────────────────────────"; }
+ui_section() { echo; echo "▍$1"; }
+ui_ok() { echo "$I_OK $*"; }
+ui_info() { echo "$I_INFO $*"; }
+ui_warn() { echo "$I_WARN $*" >&2; }
+ui_error() { echo "$I_ERR $*" >&2; }
+ui_run() { echo "$I_RUN $*"; }
+ui_kv() { echo "  $1: $2"; }
+ui_kv_arrow() { echo "  $1 → $2"; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { ui_error "缺少命令: $1"; exit 1; }
+}
+
+need_cmd curl
+need_cmd python3
+
+mkdir -p "$PROVIDERS_DIR"
+
+# ----------------- Python / API Helper -----------------
+json_quote() {
+  # 纯 Bash JSON 字符串转义，避免生成配置时反复启动 Python。
+  local s="${1-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '"%s"\n' "$s"
+}
+
+urlenc() {
+  python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
+
+pretty_json() {
+  if command -v jq >/dev/null 2>&1; then jq .
+  else python3 -m json.tool; fi
+}
+
+curl_api() {
+  local method="$1"; shift
+  local path="$1"; shift || true
+  local -a cmd=(curl -fsSL -X "$method")
+  [[ -n "$SECRET" ]] && cmd+=( -H "Authorization: Bearer $SECRET" )
+  cmd+=( "$CONTROLLER$path" )
+  (($# > 0)) && cmd+=( "$@" )
+  "${cmd[@]}" 2>/dev/null
+}
+
+controller_alive() {
+  curl_api GET "/version" >/dev/null 2>&1
+}
+
+merge_regex() {
+  # 合并两个正则字符串；任意一个为空则返回另一个。
+  # 这里不主动包裹 (?:...)，避免与 Mihomo/Go regexp 的实现细节冲突。
+  local a="${1:-}" b="${2:-}"
+  if [[ -n "$a" && -n "$b" ]]; then
+    echo "$a|$b"
+  elif [[ -n "$a" ]]; then
+    echo "$a"
+  else
+    echo "$b"
+  fi
+}
+
+# ----------------- State Management -----------------
+init_state() {
+  [[ -f "$STATE_FILE" ]] && return 0
+  echo '{"airports": []}' > "$STATE_FILE"
+}
+
+# 遍历所有机场: 返回 id, name, url, exclude_regex
+state_iter() {
+  python3 - "$STATE_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+    for a in data.get('airports', []):
+        print(f"{a['id']}\t{a['name']}\t{a.get('url','')}\t{a.get('exclude_regex','')}")
+except Exception:
+    pass
+PY
+}
+
+state_remove() {
+  local target_id="$1"
+  python3 - "$STATE_FILE" "$target_id" <<'PY'
+import json, sys
+path, target = sys.argv[1], sys.argv[2]
+with open(path, encoding='utf-8') as f:
+    data = json.load(f)
+data['airports'] = [a for a in data.get('airports', []) if a['id'] != target]
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+PY
+}
+
+resolve_id() {
+  local q="${1:-}"
+  python3 - "$STATE_FILE" "$q" <<'PY'
+import json, sys
+path, q = sys.argv[1], sys.argv[2].strip().lower().replace(' ', '')
+try:
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    for a in data.get('airports', []):
+        cands = {a['id'].lower(), a['name'].lower().replace(' ', '')}
+        cands.update([x.lower().replace(' ', '') for x in a.get('aliases', [])])
+        if q in cands:
+            print(a['id'])
+            sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+airport_name_by_id() {
+  local target_id="$1"
+  state_iter | awk -F'\t' -v tid="$target_id" '$1 == tid {print $2; exit}'
+}
+
+provider_abs() { echo "$PROVIDERS_DIR/${1}_provider.yaml"; }
+full_abs() { echo "$PROVIDERS_DIR/${1}_full.yaml"; }
+
+is_interactive_tty() {
+  [[ -n "${MHSWITCH_FORCE_INTERACTIVE:-}" || ( -t 0 && -t 1 ) ]]
+}
+
+MENU_BACK="__mhswitch_back__"
+menu_is_back() {
+  [[ "${1:-}" == "$MENU_BACK" ]]
+}
+
+choose_menu() {
+  local title="$1"
+  local context_label="${2:-}"
+  local context_value="${3:-}"
+  local idx=0
+  local key rest
+
+  while true; do
+    printf '\033[2J\033[H'
+    ui_title "$title"
+    [[ -n "$context_label" ]] && ui_kv "$context_label" "$context_value"
+    ui_kv "操作" "↑/↓ 或 k/j 移动，Enter 进入，Esc/q 返回"
+    ui_end
+    echo
+
+    for i in "${!MENU_LABELS[@]}"; do
+      if (( i == idx )); then
+        printf '  > %s\n' "${MENU_LABELS[$i]}"
+      else
+        printf '    %s\n' "${MENU_LABELS[$i]}"
+      fi
+    done
+
+    key=""
+    IFS= read -rsn1 key || return 130
+    case "$key" in
+      "")
+        MENU_SELECTION="${MENU_VALUES[$idx]}"
+        MENU_SELECTION_LABEL="${MENU_LABELS[$idx]}"
+        return 0
+        ;;
+      $'\x1b')
+        rest=""
+        if IFS= read -rsn2 -t 0.05 rest; then
+          case "$rest" in
+            "[A") idx=$(( (idx - 1 + ${#MENU_LABELS[@]}) % ${#MENU_LABELS[@]} )) ;;
+            "[B") idx=$(( (idx + 1) % ${#MENU_LABELS[@]} )) ;;
+            *) MENU_SELECTION="$MENU_BACK"; MENU_SELECTION_LABEL="返回"; return 0 ;;
+          esac
+        else
+          MENU_SELECTION="$MENU_BACK"
+          MENU_SELECTION_LABEL="返回"
+          return 0
+        fi
+        ;;
+      k|K)
+        idx=$(( (idx - 1 + ${#MENU_LABELS[@]}) % ${#MENU_LABELS[@]} ))
+        ;;
+      j|J)
+        idx=$(( (idx + 1) % ${#MENU_LABELS[@]} ))
+        ;;
+      q|Q)
+        MENU_SELECTION="$MENU_BACK"
+        MENU_SELECTION_LABEL="返回"
+        return 0
+        ;;
+    esac
+  done
+}
+
+choose_openai_target_interactive() {
+  if ! is_interactive_tty; then
+    ui_error "当前不是交互式终端，无法使用上下键选择"
+    ui_info "可用命令: mhswitch openai best|strict|global|direct|机场名 [auto|strict|global]"
+    return 1
+  fi
+
+  local id name url exclude airport_choice airport_label rule_choice
+
+  while true; do
+    MENU_LABELS=("全部机场" "DIRECT")
+    MENU_VALUES=("all" "direct")
+
+    while IFS=$'\t' read -r id name url exclude; do
+      [[ -s "$(provider_abs "$id")" ]] || continue
+      MENU_LABELS+=("$name")
+      MENU_VALUES+=("airport:$id")
+    done < <(state_iter)
+
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "选择 OpenAI/Codex 机场范围" "固定地区" "$AI_REGION_NAME" || return $?
+    menu_is_back "$MENU_SELECTION" && return 130
+    airport_choice="$MENU_SELECTION"
+    airport_label="$MENU_SELECTION_LABEL"
+
+    if [[ "$airport_choice" == "direct" ]]; then
+      OPENAI_TARGET_SELECTION="DIRECT"
+      printf '\033[2J\033[H'
+      ui_ok "已选择 OpenAI/Codex 策略"
+      ui_kv "机场范围" "$airport_label"
+      ui_kv_arrow "OpenAI" "$OPENAI_TARGET_SELECTION"
+      return 0
+    fi
+
+    if [[ "$airport_choice" == "all" ]]; then
+      MENU_LABELS=("${AI_REGION_NAME} 优先 + 全地区兜底" "仅固定 ${AI_REGION_NAME} 地区" "全地区 OpenAI 检测组")
+      MENU_VALUES=("$OPENAI_AUTO_GROUP" "OpenAI-${AI_REGION_NAME}-最优" "$OPENAI_GLOBAL_GROUP")
+    else
+      id="${airport_choice#airport:}"
+      name="$(airport_name_by_id "$id")"
+      MENU_LABELS=("${name}: ${AI_REGION_NAME} 优先 + 全地区兜底" "${name}: 仅固定 ${AI_REGION_NAME} 地区" "${name}: 全地区 OpenAI 检测组")
+      MENU_VALUES=("OpenAI-${name}-可用优先" "OpenAI-${name}-${AI_REGION_NAME}" "OpenAI-${name}-全地区-最优")
+    fi
+
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "选择 OpenAI/Codex 规则" "机场范围" "$airport_label" || return $?
+    menu_is_back "$MENU_SELECTION" && continue
+    rule_choice="$MENU_SELECTION_LABEL"
+    OPENAI_TARGET_SELECTION="$MENU_SELECTION"
+
+    printf '\033[2J\033[H'
+    ui_ok "已选择 OpenAI/Codex 策略"
+    ui_kv "机场范围" "$airport_label"
+    ui_kv "规则" "$rule_choice"
+    ui_kv_arrow "OpenAI" "$OPENAI_TARGET_SELECTION"
+    return 0
+  done
+}
+
+emit_process_path_rule() {
+  local path="$1" group="$2"
+  [[ -n "$path" ]] || return 0
+  echo "  - $(json_quote "PROCESS-PATH,$path,$group")"
+}
+
+emit_process_rules() {
+  local process="$1" group="$2"
+  local bin_path="" real_path="" real_name=""
+
+  echo "  - $(json_quote "PROCESS-NAME,$process,$group")"
+  echo "  - $(json_quote "PROCESS-NAME,$process (deleted),$group")"
+  echo "  - $(json_quote "PROCESS-NAME-WILDCARD,$process*,$group")"
+
+  if bin_path="$(command -v "$process" 2>/dev/null)"; then
+    emit_process_path_rule "$bin_path" "$group"
+    real_path="$(readlink -f "$bin_path" 2>/dev/null || true)"
+    if [[ -n "$real_path" && "$real_path" != "$bin_path" ]]; then
+      emit_process_path_rule "$real_path" "$group"
+      real_name="$(basename "$real_path")"
+      if [[ -n "$real_name" && "$real_name" != "$process" ]]; then
+        echo "  - $(json_quote "PROCESS-NAME,$real_name,$group")"
+        echo "  - $(json_quote "PROCESS-NAME,$real_name (deleted),$group")"
+        echo "  - $(json_quote "PROCESS-NAME-WILDCARD,$real_name*,$group")"
+      fi
+    fi
+  fi
+}
+
+emit_domestic_direct_rules() {
+  cat <<'EOF'
+  # Domestic and private networks are always DIRECT.
+  - GEOSITE,private,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+EOF
+}
+
+emit_browser_process_rules() {
+  local group="$1"
+  local browser
+  for browser in \
+    firefox firefox-bin \
+    microsoft-edge microsoft-edge-stable msedge \
+    chromium chromium-browser \
+    google-chrome google-chrome-stable \
+    brave-browser vivaldi vivaldi-bin opera opera-stable; do
+    emit_process_rules "$browser" "$group"
+  done
+}
+
+# ----------------- Daemon Control -----------------
+mihomo_asset_arch() {
+  case "${1:-$(uname -m)}" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    armv5l|armv5) echo "armv5" ;;
+    i386|i486|i586|i686|x86) echo "386" ;;
+    mips64el|mips64le) echo "mips64le" ;;
+    mips64) echo "mips64" ;;
+    mipsel|mipsle) echo "mipsle-softfloat" ;;
+    mips) echo "mips-softfloat" ;;
+    ppc64le) echo "ppc64le" ;;
+    riscv64) echo "riscv64" ;;
+    s390x) echo "s390x" ;;
+    loongarch64|loong64) echo "loong64-abi2" ;;
+    *) return 1 ;;
+  esac
+}
+
+latest_mihomo_tag() {
+  local tag="${MHSWITCH_MIHOMO_VERSION:-}"
+  if [[ -n "$tag" ]]; then
+    [[ "$tag" == v* ]] || tag="v$tag"
+    echo "$tag"
+    return 0
+  fi
+
+  tag="$(curl -fsSIL --connect-timeout 10 --max-time 30 --retry 2 \
+    -A 'mhswitch/1.0' "$MIHOMO_RELEASE_LATEST_URL" \
+    | sed -n 's#^[Ll]ocation: .*/tag/\([^[:space:]\r]*\).*#\1#p' \
+    | tail -n 1)"
+  [[ -n "$tag" ]] || {
+    ui_error "无法确定 Mihomo 最新稳定版本"
+    return 1
+  }
+  echo "$tag"
+}
+
+mihomo_binary_works() {
+  local bin="$1"
+  [[ -x "$bin" ]] && "$bin" -v >/dev/null 2>&1
+}
+
+install_mihomo() {
+  need_cmd curl
+  need_cmd gzip
+
+  local os arch tag asset url target tmp_dir archive candidate version
+  os="$(uname -s)"
+  [[ "$os" == "Linux" ]] || {
+    ui_error "自动安装目前仅支持 Linux，当前系统: $os"
+    return 1
+  }
+  arch="$(mihomo_asset_arch)" || {
+    ui_error "不支持的 CPU 架构: $(uname -m)"
+    return 1
+  }
+
+  if [[ -n "${MHSWITCH_MIHOMO_DOWNLOAD_URL:-}" ]]; then
+    url="$MHSWITCH_MIHOMO_DOWNLOAD_URL"
+    version="自定义安装包"
+  else
+    tag="$(latest_mihomo_tag)" || return 1
+    # amd64 明确选择 GOAMD64 v1，兼容不支持较新指令集的 x86_64 CPU。
+    if [[ "$arch" == "amd64" ]]; then
+      asset="mihomo-linux-amd64-v1-${tag}.gz"
+    else
+      asset="mihomo-linux-${arch}-${tag}.gz"
+    fi
+    url="${MIHOMO_RELEASE_BASE_URL}/${tag}/${asset}"
+    version="$tag"
+  fi
+
+  target="$MIHOMO_INSTALL_DIR/mihomo"
+  tmp_dir="$(mktemp -d)"
+  archive="$tmp_dir/mihomo.gz"
+  candidate="$tmp_dir/mihomo"
+
+  ui_title "安装 Mihomo"
+  ui_kv "版本" "$version"
+  ui_kv "架构" "$arch"
+  ui_kv "位置" "$target"
+  ui_run "从官方发布页下载安装包"
+
+  if ! curl -fL --connect-timeout 15 --max-time 180 --retry 3 \
+      -A 'mhswitch/1.0' "$url" -o "$archive"; then
+    rm -rf "$tmp_dir"
+    ui_error "Mihomo 下载失败"
+    ui_info "下载地址: $url"
+    ui_end
+    return 1
+  fi
+  if ! gzip -t "$archive" || ! gzip -dc "$archive" > "$candidate"; then
+    rm -rf "$tmp_dir"
+    ui_error "安装包损坏或格式不正确"
+    ui_end
+    return 1
+  fi
+  chmod 0755 "$candidate"
+  if ! mihomo_binary_works "$candidate"; then
+    rm -rf "$tmp_dir"
+    ui_error "下载的 Mihomo 无法在当前系统运行"
+    ui_end
+    return 1
+  fi
+
+  mkdir -p "$MIHOMO_INSTALL_DIR"
+  mv -f "$candidate" "$target"
+  rm -rf "$tmp_dir"
+  MIHOMO_BIN="$target"
+  ui_ok "Mihomo 安装完成"
+  ui_kv "程序" "$target"
+  ui_kv "版本" "$("$target" -v 2>/dev/null | head -n 1)"
+  ui_end
+}
+
+find_mihomo_bin() {
+  if [[ -n "$MIHOMO_BIN" && -x "$MIHOMO_BIN" ]]; then echo "$MIHOMO_BIN"; return 0; fi
+  if command -v mihomo >/dev/null 2>&1; then command -v mihomo; return 0; fi
+  if command -v clash-meta >/dev/null 2>&1; then command -v clash-meta; return 0; fi
+  if [[ -x "$MIHOMO_INSTALL_DIR/mihomo" ]]; then echo "$MIHOMO_INSTALL_DIR/mihomo"; return 0; fi
+  return 1
+}
+
+ensure_mihomo_installed() {
+  local bin=""
+  if bin="$(find_mihomo_bin 2>/dev/null)" && mihomo_binary_works "$bin"; then
+    MIHOMO_BIN="$bin"
+    return 0
+  fi
+  [[ -z "$bin" ]] || ui_warn "检测到的 Mihomo 无法运行，将重新安装"
+  install_mihomo
+}
+
+state_has_airports() {
+  local id name url exclude
+  while IFS=$'\t' read -r id name url exclude; do
+    [[ -n "$id" ]] && return 0
+  done < <(state_iter)
+  return 1
+}
+
+first_run_setup() {
+  state_has_airports && return 0
+
+  if ! is_interactive_tty; then
+    ui_warn "尚未配置机场；非交互启动将使用直连配置"
+    ui_info "添加订阅: mhswitch add <订阅URL> [名称]"
+    return 0
+  fi
+
+  ui_title "首次启动设置"
+  ui_info "请输入机场订阅链接；链接仅保存在本机状态文件中。"
+  ui_info "直接回车可暂时跳过，稍后使用 mhswitch add 添加。"
+  ui_end
+
+  local url
+  url="$(panel_prompt "机场订阅 URL")" || return 1
+  if [[ -z "$url" ]]; then
+    ui_warn "已跳过机场配置，将以直连模式启动"
+    return 0
+  fi
+  add_airport "$url"
+}
+
+start_managed_mihomo() {
+  ensure_mihomo_installed || return 1
+  first_run_setup || return 1
+  generate_config
+  start_mihomo
+}
+
+start_mihomo() {
+  if controller_alive; then
+    ui_ok "Mihomo 已在运行"
+    ui_kv "控制器" "$CONTROLLER"
+    return 0
+  fi
+
+  ensure_mihomo_installed || return 1
+  local bin="$MIHOMO_BIN"
+
+  ui_title "启动 Mihomo"
+  ui_kv "程序" "$bin"
+  ui_kv "配置" "$CONFIG_FILE"
+  ui_kv "日志" "$BASE_DIR/mihomo.log"
+
+  nohup "$bin" -d "$BASE_DIR" -f "$CONFIG_FILE" >"$BASE_DIR/mihomo.log" 2>&1 &
+  echo $! > "$PID_FILE"
+
+  for _ in {1..20}; do
+    sleep 0.5
+    if controller_alive; then
+      ui_ok "启动成功"
+      ui_kv "控制器" "$CONTROLLER"
+      ui_end
+      return 0
+    fi
+  done
+
+  ui_error "启动超时或失败"
+  ui_info "查看日志: mhswitch log"
+  ui_end
+  return 1
+}
+
+stop_mihomo() {
+  if [[ -f "$PID_FILE" ]]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  else
+    pkill -f "mihomo -d $BASE_DIR" || true
+  fi
+  ui_ok "Mihomo 已停止"
+}
+
+# ----------------- Core Logic -----------------
+download_subscription() {
+  local src="$1" dest="$2"
+  src="${src/#\~/$HOME}"
+  # 伪装成 Clash Meta 客户端并支持 Gzip 解压，确保机场下发 YAML 而不是 Base64 乱码。
+  local ua="clash-meta/1.18.0"
+  if [[ "$src" =~ ^https?:// ]]; then
+    # 默认直接忽略系统代理，强制直连下载订阅。
+    curl -fL -A "$ua" --compressed --noproxy "*" --connect-timeout 10 --max-time 60 --retry 3 "$src" -o "$dest" || return 1
+  elif [[ "$src" =~ ^file:// ]]; then
+    cp "${src#file://}" "$dest" || return 1
+  elif [[ -f "$src" ]]; then
+    cp "$src" "$dest" || return 1
+  else
+    ui_error "无效的订阅路径或 URL：$src"
+    return 1
+  fi
+}
+
+# 分析订阅并提取信息，支持自动识别机场名称。
+analyze_sub() {
+  local full_file="$1" provider_file="$2" default_name="${3:-}" id="$4"
+  python3 - "$full_file" "$provider_file" "$default_name" "$id" <<'PY'
+import json, os, re, sys
+full_file, provider_file, default_name, aid = sys.argv[1:5]
+text = open(full_file, 'r', encoding='utf-8', errors='ignore').read()
+lines = text.splitlines()
+
+start, end = None, len(lines)
+for i, line in enumerate(lines):
+    if re.match(r'^\s*proxies\s*:\s*$', line):
+        start = i
+        break
+if start is None:
+    sys.exit('未找到 proxies: 字段')
+for j in range(start + 1, len(lines)):
+    if re.match(r'^[a-zA-Z0-9]', lines[j]):
+        end = j
+        break
+
+block = lines[start:end]
+os.makedirs(os.path.dirname(provider_file), exist_ok=True)
+with open(provider_file, 'w', encoding='utf-8') as f:
+    f.write('\n'.join(block).rstrip() + '\n')
+
+proxy_names = []
+for line in block[1:]:
+    m = re.search(r'name:\s*(?:\'([^\']+)\'|"([^"]+)"|([^,}]+))', line)
+    if m:
+        proxy_names.append(next(x for x in m.groups() if x).strip())
+
+detected_name = default_name
+if not detected_name:
+    pg_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*proxy-groups\s*:\s*$', line):
+            pg_idx = i
+            break
+    if pg_idx is not None:
+        for line in lines[pg_idx+1:]:
+            if re.match(r'^[a-zA-Z0-9]', line):
+                break
+            m = re.search(r'^\s*-\s*\{\s*name:\s*(?:\'([^\']+)\'|"([^"]+)"|([^,}]+))', line)
+            if not m:
+                m = re.search(r'^\s*-\s*name:\s*(?:\'([^\']+)\'|"([^"]+)"|(.+))', line)
+            if m:
+                raw = next(x for x in m.groups() if x).strip()
+                if raw not in ['PROXIES', 'DIRECT', 'REJECT', 'Fallback', 'Auto', '自动选择', '节点选择']:
+                    raw = re.sub(r'^(🚀|✈️|☁️|💡|✨|🌟|🎈|🦄|🌐)\s*', '', raw)
+                    detected_name = raw
+                    break
+    if not detected_name and proxy_names:
+        detected_name = f"Airport_{aid}"
+
+patterns = ['防失联', '剩余流量', '套餐到期', '如无可用', '官网下载', '官网', '测试', '距离下次重置', '过期时间']
+found = [p for p in patterns if any(p in name for name in proxy_names)]
+exclude_regex = '|'.join(re.escape(p) for p in found)
+
+print(json.dumps({
+    'name': detected_name,
+    'exclude_regex': exclude_regex,
+    'count': len(proxy_names)
+}, ensure_ascii=False))
+PY
+}
+
+add_airport() {
+  local url="$1" custom_name="${2:-}"
+  local tmp_full tmp_prov meta new_name exclude count target_id
+
+  tmp_full="$(mktemp)"
+  tmp_prov="$(mktemp)"
+
+  ui_title "添加/更新机场"
+  ui_run "拉取订阅"
+  download_subscription "$url" "$tmp_full" || { rm -f "$tmp_full" "$tmp_prov"; return 1; }
+
+  meta="$(analyze_sub "$tmp_full" "$tmp_prov" "$custom_name" "tmp")" || {
+    ui_error "解析订阅失败，请检查 URL 或订阅格式"
+    rm -f "$tmp_full" "$tmp_prov"
+    return 1
+  }
+
+  new_name="$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")"
+  exclude="$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin)['exclude_regex'])")"
+  count="$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin)['count'])")"
+
+  target_id=$(python3 - "$STATE_FILE" "$new_name" "$url" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        data = json.load(f)
+    for a in data.get('airports', []):
+        if a['name'] == sys.argv[2] or a.get('url') == sys.argv[3]:
+            print(a['id'])
+            sys.exit(0)
+except Exception:
+    pass
+PY
+)
+
+  if [[ -z "$target_id" ]]; then
+    target_id="a_$(date +%s)_$RANDOM"
+    ui_ok "添加新机场成功"
+    ui_kv "机场" "$new_name"
+    ui_kv "节点数" "$count"
+  else
+    ui_ok "发现已有机场，已覆盖更新"
+    ui_kv "机场" "$new_name"
+    ui_kv "节点数" "$count"
+  fi
+
+  mv "$tmp_full" "$(full_abs "$target_id")"
+  mv "$tmp_prov" "$(provider_abs "$target_id")"
+
+  python3 - "$STATE_FILE" "$target_id" "$new_name" "$url" "$exclude" <<'PY'
+import json, sys
+path, aid, name, url, ex = sys.argv[1:6]
+try:
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+except Exception:
+    data = {'airports': []}
+
+found = False
+for a in data.get('airports', []):
+    if a['id'] == aid:
+        a['name'] = name
+        a['url'] = url
+        a['exclude_regex'] = ex
+        found = True
+        break
+
+if not found:
+    if 'airports' not in data:
+        data['airports'] = []
+    data['airports'].append({
+        'id': aid,
+        'name': name,
+        'url': url,
+        'exclude_regex': ex,
+        'aliases': []
+    })
+
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+PY
+
+  ui_end
+  generate_config && reload_config
+}
+
+generate_config() {
+  local cfg_tmp
+  cfg_tmp="$(mktemp)"
+  {
+    cat <<'EOF'
+mixed-port: 17890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+dns:
+  enable: true
+  use-hosts: true
+  nameserver: [119.29.29.29, 223.5.5.5, tls://dns.google:853]
+proxy-providers:
+EOF
+
+    local has_airport=0
+    local all_ids=""
+    local all_excludes=""
+
+    while IFS=$'\t' read -r id name url exclude; do
+      local pabs
+      pabs="$(provider_abs "$id")"
+      [[ -s "$pabs" ]] || continue
+      has_airport=1
+      all_ids="$all_ids, $id"
+      if [[ -n "$exclude" ]]; then
+        [[ -z "$all_excludes" ]] && all_excludes="$exclude" || all_excludes="$all_excludes|$exclude"
+      fi
+      cat <<EOF
+  ${id}:
+    type: file
+    path: $(json_quote "$pabs")
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: ${FAILOVER_INTERVAL_DEFAULT}
+      timeout: ${FAILOVER_TIMEOUT_DEFAULT}
+      lazy: ${FAILOVER_LAZY_DEFAULT}
+EOF
+    done < <(state_iter)
+
+    echo -e "\nproxy-groups:"
+
+    if [[ $has_airport -eq 1 ]]; then
+      all_ids="${all_ids:2}"
+      local ai_all_excludes
+      ai_all_excludes="$(merge_regex "$all_excludes" "$AI_EXCLUDE_FILTER")"
+
+      # ---------------- 全局故障切换节点：普通流量可用，允许所有地区。只在当前节点 timeout / 不可用时切换。 ----------------
+      echo "  - name: $(json_quote "最优节点")"
+      echo "    type: fallback"
+      echo "    use: [$all_ids]"
+      [[ -n "$all_excludes" ]] && echo "    exclude-filter: $(json_quote "$all_excludes")"
+      echo "    url: https://www.gstatic.com/generate_204"
+      echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+      echo "    timeout: ${FAILOVER_TIMEOUT_DEFAULT}"
+      echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+      # ---------------- AI 地区故障切换：Claude / OpenAI / Codex 固定地区，不固定节点。只在当前节点 timeout / 不可用时切换。 ----------------
+      echo "  - name: $(json_quote "Claude-${AI_REGION_NAME}-最优")"
+      echo "    type: fallback"
+      echo "    use: [$all_ids]"
+      echo "    filter: $(json_quote "$AI_REGION_FILTER")"
+      [[ -n "$all_excludes" ]] && echo "    exclude-filter: $(json_quote "$all_excludes")"
+      echo "    url: $(json_quote "$CLAUDE_TEST_URL")"
+      echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+      echo "    timeout: ${FAILOVER_TIMEOUT_DEFAULT}"
+      echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+      echo "  - name: $(json_quote "OpenAI-${AI_REGION_NAME}-最优")"
+      echo "    type: fallback"
+      echo "    use: [$all_ids]"
+      echo "    filter: $(json_quote "$AI_REGION_FILTER")"
+      [[ -n "$ai_all_excludes" ]] && echo "    exclude-filter: $(json_quote "$ai_all_excludes")"
+      echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+      echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+      echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+      echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+      # OpenAI 全地区兜底组：仍用 OpenAI/ChatGPT 地址检测，但不限制地区。
+      # 当固定地区候选全部失败时，OpenAI-可用优先 会退到这里，避免长期粘住坏节点。
+      echo "  - name: $(json_quote "$OPENAI_GLOBAL_GROUP")"
+      echo "    type: fallback"
+      echo "    use: [$all_ids]"
+      [[ -n "$ai_all_excludes" ]] && echo "    exclude-filter: $(json_quote "$ai_all_excludes")"
+      echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+      echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+      echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+      echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+      # OpenAI 自动兜底组：优先固定地区；固定地区全挂时，退到全地区 OpenAI 检测组；再退到普通最优。
+      echo "  - name: $(json_quote "$OPENAI_AUTO_GROUP")"
+      echo "    type: fallback"
+      echo "    proxies:"
+      echo "      - $(json_quote "OpenAI-${AI_REGION_NAME}-最优")"
+      echo "      - $(json_quote "$OPENAI_GLOBAL_GROUP")"
+      echo "      - $(json_quote "最优节点")"
+      echo "      - DIRECT"
+      echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+      echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+      echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+      echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+      # 兼容旧名字：如果你之前选择过 Claude-最优 / OpenAI-最优，仍可使用。
+      echo "  - name: $(json_quote "Claude-最优")"
+      echo "    type: select"
+      echo "    proxies:"
+      echo "      - $(json_quote "Claude-${AI_REGION_NAME}-最优")"
+
+      echo "  - name: $(json_quote "OpenAI-最优")"
+      echo "    type: select"
+      echo "    proxies:"
+      echo "      - $(json_quote "$OPENAI_AUTO_GROUP")"
+      echo "      - $(json_quote "OpenAI-${AI_REGION_NAME}-最优")"
+      echo "      - $(json_quote "$OPENAI_GLOBAL_GROUP")"
+
+      # 动态生成各个机场的专属组。
+      while IFS=$'\t' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+
+        # 普通自动组：所有地区节点故障切换。只在当前节点 timeout / 不可用时切换。
+        echo "  - name: $(json_quote "${name}-自动")"
+        echo "    type: fallback"
+        echo "    use: [${id}]"
+        [[ -n "$exclude" ]] && echo "    exclude-filter: $(json_quote "$exclude")"
+        echo "    url: https://www.gstatic.com/generate_204"
+        echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+        echo "    timeout: ${FAILOVER_TIMEOUT_DEFAULT}"
+        echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+        # 普通手动组：用户手动选具体节点。
+        echo "  - name: $(json_quote "${name}-手动")"
+        echo "    type: select"
+        echo "    use: [${id}]"
+        [[ -n "$exclude" ]] && echo "    exclude-filter: $(json_quote "$exclude")"
+
+        # Claude 单机场地区组：固定地区，在该机场同地区节点中故障切换。
+        echo "  - name: $(json_quote "Claude-${name}-${AI_REGION_NAME}")"
+        echo "    type: fallback"
+        echo "    use: [${id}]"
+        echo "    filter: $(json_quote "$AI_REGION_FILTER")"
+        [[ -n "$exclude" ]] && echo "    exclude-filter: $(json_quote "$exclude")"
+        echo "    url: $(json_quote "$CLAUDE_TEST_URL")"
+        echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+        echo "    timeout: ${FAILOVER_TIMEOUT_DEFAULT}"
+        echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+        # OpenAI / Codex 单机场地区组：固定地区，在该机场同地区节点中故障切换。
+        local ai_exclude
+        ai_exclude="$(merge_regex "$exclude" "$AI_EXCLUDE_FILTER")"
+        echo "  - name: $(json_quote "OpenAI-${name}-${AI_REGION_NAME}")"
+        echo "    type: fallback"
+        echo "    use: [${id}]"
+        echo "    filter: $(json_quote "$AI_REGION_FILTER")"
+        [[ -n "$ai_exclude" ]] && echo "    exclude-filter: $(json_quote "$ai_exclude")"
+        echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+        echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+        echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+        echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+        # OpenAI / Codex 单机场全地区组：限定同一机场，但不限制地区。
+        echo "  - name: $(json_quote "OpenAI-${name}-全地区-最优")"
+        echo "    type: fallback"
+        echo "    use: [${id}]"
+        [[ -n "$ai_exclude" ]] && echo "    exclude-filter: $(json_quote "$ai_exclude")"
+        echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+        echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+        echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+        echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+
+        # OpenAI / Codex 单机场可用优先组：同一机场内固定地区优先，失败时退到该机场全地区。
+        echo "  - name: $(json_quote "OpenAI-${name}-可用优先")"
+        echo "    type: fallback"
+        echo "    proxies:"
+        echo "      - $(json_quote "OpenAI-${name}-${AI_REGION_NAME}")"
+        echo "      - $(json_quote "OpenAI-${name}-全地区-最优")"
+        echo "      - $(json_quote "${name}-自动")"
+        echo "      - DIRECT"
+        echo "    url: $(json_quote "$OPENAI_TEST_URL")"
+        echo "    interval: ${FAILOVER_INTERVAL_DEFAULT}"
+        echo "    timeout: ${OPENAI_TEST_TIMEOUT_DEFAULT}"
+        echo "    lazy: ${FAILOVER_LAZY_DEFAULT}"
+      done < <(state_iter)
+
+      # 聚合默认代理组：普通流量默认走全局故障切换组，可手动切机场。
+      echo "  - name: $(json_quote "默认代理")"
+      echo "    type: select"
+      echo "    proxies:"
+      echo "      - $(json_quote "最优节点")"
+      echo "      - DIRECT"
+      while IFS=$'\t' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+        echo "      - $(json_quote "${name}-自动")"
+        echo "      - $(json_quote "${name}-手动")"
+      done < <(state_iter)
+
+      # 聚合 Claude 组：默认固定 AI_REGION_NAME 地区，在该地区内故障切换。
+      echo "  - name: $(json_quote "Claude")"
+      echo "    type: select"
+      echo "    proxies:"
+      echo "      - $(json_quote "Claude-${AI_REGION_NAME}-最优")"
+      while IFS=$'\t' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+        echo "      - $(json_quote "Claude-${name}-${AI_REGION_NAME}")"
+      done < <(state_iter)
+      echo "      - REJECT"
+
+      # 聚合 OpenAI / Codex 组：默认“固定地区优先 + 全地区兜底”，避免固定地区全挂时卡死在坏节点。
+      echo "  - name: $(json_quote "OpenAI")"
+      echo "    type: select"
+      echo "    proxies:"
+      echo "      - $(json_quote "$OPENAI_AUTO_GROUP")"
+      echo "      - $(json_quote "OpenAI-${AI_REGION_NAME}-最优")"
+      echo "      - $(json_quote "$OPENAI_GLOBAL_GROUP")"
+      while IFS=$'	' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+        echo "      - $(json_quote "OpenAI-${name}-可用优先")"
+        echo "      - $(json_quote "OpenAI-${name}-${AI_REGION_NAME}")"
+        echo "      - $(json_quote "OpenAI-${name}-全地区-最优")"
+      done < <(state_iter)
+      echo "      - $(json_quote "Claude-${AI_REGION_NAME}-最优")"
+      echo "      - $(json_quote "最优节点")"
+      echo "      - DIRECT"
+
+      # Git Clone 组：可在 DIRECT / 默认代理 / 最优节点 / 单机场自动之间切换。
+      echo "  - name: $(json_quote "$GIT_GROUP_NAME")"
+      echo "    type: select"
+      echo "    proxies:"
+      case "${GIT_PROXY_DEFAULT,,}" in
+        proxy|代理|on|yes|true|1)
+          echo "      - $(json_quote "默认代理")"
+          echo "      - DIRECT"
+          echo "      - $(json_quote "最优节点")"
+          ;;
+        best|auto|最优)
+          echo "      - $(json_quote "最优节点")"
+          echo "      - DIRECT"
+          echo "      - $(json_quote "默认代理")"
+          ;;
+        direct|直连|off|no|false|0|"")
+          echo "      - DIRECT"
+          echo "      - $(json_quote "默认代理")"
+          echo "      - $(json_quote "最优节点")"
+          ;;
+        *)
+          echo "      - $(json_quote "$GIT_PROXY_DEFAULT")"
+          echo "      - DIRECT"
+          echo "      - $(json_quote "默认代理")"
+          echo "      - $(json_quote "最优节点")"
+          ;;
+      esac
+      while IFS=$'\t' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+        echo "      - $(json_quote "${name}-自动")"
+        echo "      - $(json_quote "${name}-手动")"
+      done < <(state_iter)
+    else
+      echo "  - name: 默认代理"
+      echo "    type: select"
+      echo "    proxies: [DIRECT]"
+      echo "  - name: Claude"
+      echo "    type: select"
+      echo "    proxies: [DIRECT, REJECT]"
+      echo "  - name: OpenAI"
+      echo "    type: select"
+      echo "    proxies: [DIRECT]"
+      echo "  - name: $(json_quote "$GIT_GROUP_NAME")"
+      echo "    type: select"
+      echo "    proxies: [DIRECT]"
+    fi
+
+    cat <<'EOF'
+rules:
+  # Only Claude CLI and Codex CLI processes use proxy.
+EOF
+
+    emit_process_rules "claude" "Claude"
+    emit_process_rules "codex" "OpenAI"
+
+    cat <<'EOF'
+
+  # OpenAI / ChatGPT domains - force proxy
+  - DOMAIN-SUFFIX,chatgpt.com,OpenAI
+  - DOMAIN-SUFFIX,openai.com,OpenAI
+  - DOMAIN-SUFFIX,oaistatic.com,OpenAI
+  - DOMAIN-SUFFIX,oaiusercontent.com,OpenAI
+  - DOMAIN-SUFFIX,openaiusercontent.com,OpenAI
+  - DOMAIN-SUFFIX,oaicdn.com,OpenAI
+EOF
+
+    echo
+    emit_domestic_direct_rules
+
+    echo
+    echo "  # Bioinformatics data downloads - force DIRECT"
+    echo "  - DOMAIN-SUFFIX,cncb.ac.cn,DIRECT"
+    echo "  - DOMAIN,share.cncb.ac.cn,DIRECT"
+    echo "  - DOMAIN-SUFFIX,ncbi.nlm.nih.gov,DIRECT"
+    echo "  - DOMAIN,eutils.ncbi.nlm.nih.gov,DIRECT"
+    echo "  - DOMAIN,trace.ncbi.nlm.nih.gov,DIRECT"
+    echo "  - DOMAIN,sra-download.ncbi.nlm.nih.gov,DIRECT"
+    echo "  - DOMAIN,sra-downloadb.be-md.ncbi.nlm.nih.gov,DIRECT"
+    
+    echo
+    echo "  # Conda / Anaconda package downloads - force DIRECT"
+    echo "  - DOMAIN-SUFFIX,anaconda.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,anaconda.org,DIRECT"
+    echo "  - DOMAIN-SUFFIX,conda-forge.org,DIRECT"
+    echo "  - DOMAIN-SUFFIX,repo.anaconda.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,conda.anaconda.org,DIRECT"
+    echo "  - DOMAIN-SUFFIX,mirrors.tuna.tsinghua.edu.cn,DIRECT"
+    echo "  - DOMAIN-SUFFIX,mirrors.ustc.edu.cn,DIRECT"
+    echo "  - DOMAIN-SUFFIX,mirrors.bfsu.edu.cn,DIRECT"
+    echo "  - DOMAIN-SUFFIX,mirrors.aliyun.com,DIRECT"
+
+    echo
+    echo "  # Browsers use normal rule proxy: China/private direct above, remaining browser traffic via default proxy."
+    emit_browser_process_rules "默认代理"
+
+    echo
+    echo "  # Git Clone / Git hosting - force DIRECT"
+    echo "  - DOMAIN-SUFFIX,github.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,githubusercontent.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,githubassets.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,gitlab.com,DIRECT"
+    echo "  - DOMAIN-SUFFIX,bitbucket.org,DIRECT"
+
+    cat <<'EOF'
+
+  - MATCH,DIRECT
+EOF
+  } > "$cfg_tmp"
+  mv "$cfg_tmp" "$CONFIG_FILE"
+}
+
+reload_config() {
+  if controller_alive; then
+    curl_api PUT "/configs?force=true" -H 'Content-Type: application/json' -d "{\"path\":$(json_quote "$CONFIG_FILE")}" >/dev/null || true
+    ui_ok "配置已热重载"
+    ui_kv "配置" "$CONFIG_FILE"
+  else
+    start_mihomo || true
+  fi
+}
+
+refresh_all() {
+  local updated=0
+  while IFS=$'\t' read -r id name url exclude; do
+    if [[ -n "$url" ]]; then
+      ui_run "更新机场: $name"
+      if download_subscription "$url" "$(full_abs "$id")"; then
+        analyze_sub "$(full_abs "$id")" "$(provider_abs "$id")" "$name" "$id" >/dev/null
+        updated=1
+      fi
+    fi
+  done < <(state_iter)
+
+  if [[ $updated -eq 1 ]]; then
+    generate_config && reload_config
+    ui_ok "所有订阅已更新完毕"
+  else
+    ui_warn "没有可更新的机场"
+  fi
+}
+
+# ----------------- Node Inventory -----------------
+print_provider_nodes() {
+  local provider_file="$1"
+  local exclude_regex="${2:-}"
+
+  python3 - "$provider_file" "$exclude_regex" <<'PY'
+import re
+import sys
+
+path, exclude_regex = sys.argv[1], sys.argv[2]
+
+try:
+    text = open(path, 'r', encoding='utf-8', errors='ignore').read()
+except FileNotFoundError:
+    print('  (provider 文件不存在，请先执行 mhswitch update)')
+    sys.exit(0)
+
+names = []
+for line in text.splitlines():
+    m = re.search(r"name:\s*(?:'([^']*)'|\"([^\"]*)\"|([^,}#]+))", line)
+    if not m:
+        continue
+    name = next((x for x in m.groups() if x is not None), '').strip()
+    if name:
+        names.append(name)
+
+if not names:
+    print('  (未解析到节点)')
+    sys.exit(0)
+
+exclude = None
+if exclude_regex:
+    try:
+        exclude = re.compile(exclude_regex)
+    except re.error:
+        exclude = None
+
+print(f'  节点数: {len(names)}')
+for i, name in enumerate(names, 1):
+    mark = ''
+    if exclude and exclude.search(name):
+        mark = '  (exclude-filter)'
+    print(f'  {i:>3}. {name}{mark}')
+PY
+}
+
+show_airport_nodes() {
+  local id="$1"
+  local name="$2"
+  local exclude="${3:-}"
+  local pabs
+
+  pabs="$(provider_abs "$id")"
+  ui_title "机场节点: $name"
+  print_provider_nodes "$pabs" "$exclude"
+  ui_end
+}
+
+list_nodes() {
+  local target="${1:-all}"
+  local id name url exclude
+  local found=0
+
+  case "$target" in
+    all|全部|"")
+      while IFS=$'\t' read -r id name url exclude; do
+        found=1
+        show_airport_nodes "$id" "$name" "$exclude"
+      done < <(state_iter)
+      if [[ $found -eq 0 ]]; then
+        ui_warn "没有已配置机场"
+        ui_info "请先执行: mhswitch add <订阅URL> [名称]"
+      fi
+      ;;
+    *)
+      id="$(resolve_id "$target")" || { ui_error "未找到机场: $target"; return 1; }
+      while IFS=$'\t' read -r id2 name url exclude; do
+        [[ "$id2" == "$id" ]] || continue
+        show_airport_nodes "$id2" "$name" "$exclude"
+        found=1
+        break
+      done < <(state_iter)
+      [[ $found -eq 1 ]] || { ui_error "未找到机场: $target"; return 1; }
+      ;;
+  esac
+}
+
+# ----------------- Control Panel -----------------
+panel_clear() {
+  printf '\033[2J\033[H'
+}
+
+panel_pause() {
+  is_interactive_tty || return 0
+  echo
+  read -rsn1 -p "按任意键返回控制面板..." _ || true
+  echo
+}
+
+panel_require_tty() {
+  if ! is_interactive_tty; then
+    ui_error "控制面板需要交互式终端"
+    ui_info "可用命令: mhswitch status | mhswitch help"
+    return 1
+  fi
+}
+
+panel_prompt() {
+  local prompt="$1"
+  local default="${2:-}"
+  local value=""
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " value || return 1
+    printf '%s\n' "${value:-$default}"
+  else
+    read -r -p "$prompt: " value || return 1
+    printf '%s\n' "$value"
+  fi
+}
+
+panel_confirm() {
+  local prompt="$1"
+  local answer=""
+  read -r -p "$prompt [y/N]: " answer || return 1
+  case "$answer" in
+    y|Y|yes|YES|Yes|是|确认) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+panel_select_airport() {
+  local title="${1:-选择机场}"
+  local id name url exclude
+
+  MENU_LABELS=()
+  MENU_VALUES=()
+  while IFS=$'\t' read -r id name url exclude; do
+    [[ -s "$(provider_abs "$id")" ]] || continue
+    MENU_LABELS+=("$name")
+    MENU_VALUES+=("$id")
+  done < <(state_iter)
+
+  if [[ ${#MENU_LABELS[@]} -eq 0 ]]; then
+    ui_warn "没有已配置机场"
+    ui_info "请先执行: mhswitch add <订阅URL> [名称]"
+    return 1
+  fi
+
+  MENU_SELECTION=""
+  MENU_SELECTION_LABEL=""
+  choose_menu "$title" "机场数" "${#MENU_LABELS[@]}" || return $?
+  menu_is_back "$MENU_SELECTION" && return 1
+  PANEL_AIRPORT_ID="$MENU_SELECTION"
+  PANEL_AIRPORT_NAME="$MENU_SELECTION_LABEL"
+}
+
+panel_add_airport() {
+  panel_clear
+  ui_title "新增机场"
+  ui_info "订阅 URL 只写入本地状态文件，不会在节点列表中显示。"
+  ui_end
+  echo
+
+  local url name
+  url="$(panel_prompt "订阅 URL")" || return 1
+  if [[ -z "$url" ]]; then
+    ui_warn "已取消：订阅 URL 为空"
+    return 0
+  fi
+  name="$(panel_prompt "自定义名称，可留空自动识别")" || name=""
+  add_airport "$url" "$name"
+}
+
+panel_remove_airport() {
+  local id name
+  panel_select_airport "选择要删除的机场" || return 0
+  id="$PANEL_AIRPORT_ID"
+  name="$PANEL_AIRPORT_NAME"
+
+  panel_clear
+  ui_title "删除机场"
+  ui_kv "机场" "$name"
+  ui_warn "删除会移除本地机场状态，并重新生成/热重载 Mihomo 配置。"
+  ui_end
+  echo
+
+  if panel_confirm "确认删除 $name"; then
+    state_remove "$id"
+    generate_config && reload_config
+    ui_ok "机场已删除"
+    ui_kv "机场" "$name"
+  else
+    ui_warn "已取消删除"
+  fi
+}
+
+panel_airport_nodes_one() {
+  panel_select_airport "选择要查看节点的机场" || return 0
+  list_nodes "$PANEL_AIRPORT_NAME"
+}
+
+panel_airports() {
+  local choice
+  while true; do
+    MENU_LABELS=("新增机场" "删除机场" "更新所有订阅" "查看所有机场节点" "查看指定机场节点" "返回主菜单")
+    MENU_VALUES=("add" "remove" "update" "nodes_all" "nodes_one" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "机场管理" "状态文件" "$STATE_FILE" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      add) panel_add_airport; panel_pause ;;
+      remove) panel_remove_airport; panel_pause ;;
+      update) refresh_all; panel_pause ;;
+      nodes_all) panel_clear; list_nodes all; panel_pause ;;
+      nodes_one) panel_clear; panel_airport_nodes_one; panel_pause ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_openai() {
+  local choice
+  while true; do
+    MENU_LABELS=("选择 OpenAI/Codex 机场和规则" "检测可用优先组" "逐机场检测 OpenAI" "查看当前策略" "返回主菜单")
+    MENU_VALUES=("select" "test_all" "test_each" "status" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "OpenAI/Codex 控制" "固定地区" "$AI_REGION_NAME" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      select)
+        OPENAI_TARGET_SELECTION=""
+        if choose_openai_target_interactive && [[ -n "${OPENAI_TARGET_SELECTION:-}" ]]; then
+          set_group_proxy "OpenAI" "$OPENAI_TARGET_SELECTION"
+          panel_pause
+        fi
+        ;;
+      test_all)
+        panel_clear
+        run_openai_test all "$OPENAI_TEST_TIMEOUT_DEFAULT" "$DELAY_JOBS_DEFAULT"
+        panel_pause
+        ;;
+      test_each)
+        panel_clear
+        run_openai_test each "$OPENAI_TEST_TIMEOUT_DEFAULT" "$DELAY_JOBS_DEFAULT"
+        panel_pause
+        ;;
+      status)
+        panel_clear
+        show_status
+        panel_pause
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_default_proxy() {
+  local choice id name
+  while true; do
+    MENU_LABELS=("最优节点" "DIRECT" "选择机场自动组" "选择机场手动组" "返回")
+    MENU_VALUES=("best" "direct" "airport_auto" "airport_manual" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "默认代理控制" "说明" "浏览器国外流量走默认代理，AI CLI 走专属组" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      best) set_group_proxy "默认代理" "最优节点"; panel_pause ;;
+      direct) set_group_proxy "默认代理" "DIRECT"; panel_pause ;;
+      airport_auto)
+        if panel_select_airport "选择默认代理机场"; then
+          id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
+          set_group_proxy "默认代理" "${name}-自动"
+        fi
+        panel_pause
+        ;;
+      airport_manual)
+        if panel_select_airport "选择默认代理机场"; then
+          id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
+          set_group_proxy "默认代理" "${name}-手动"
+        fi
+        panel_pause
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_claude() {
+  local choice id name
+  while true; do
+    MENU_LABELS=("全部机场固定地区最优" "选择单机场固定地区" "返回")
+    MENU_VALUES=("best" "airport" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "Claude 控制" "固定地区" "$AI_REGION_NAME" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      best) set_group_proxy "Claude" "Claude-${AI_REGION_NAME}-最优"; panel_pause ;;
+      airport)
+        if panel_select_airport "选择 Claude 机场"; then
+          id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
+          set_group_proxy "Claude" "Claude-${name}-${AI_REGION_NAME}"
+        fi
+        panel_pause
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_git() {
+  local choice
+  while true; do
+    MENU_LABELS=("查看当前 Git Clone 策略" "DIRECT" "默认代理" "最优节点" "选择机场自动组" "返回")
+    MENU_VALUES=("status" "direct" "proxy" "best" "airport" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "Git Clone 控制" "当前规则" "Git 托管域名默认 DIRECT" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      status) show_git_clone_proxy; panel_pause ;;
+      direct) set_git_clone_proxy direct; panel_pause ;;
+      proxy) set_git_clone_proxy proxy; panel_pause ;;
+      best) set_git_clone_proxy best; panel_pause ;;
+      airport)
+        if panel_select_airport "选择 Git Clone 机场"; then
+          set_git_clone_proxy "$PANEL_AIRPORT_NAME"
+        fi
+        panel_pause
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_proxy() {
+  local choice
+  while true; do
+    MENU_LABELS=("默认代理" "Claude" "Git Clone" "切换模式 rule/global/direct" "切断当前连接" "返回主菜单")
+    MENU_VALUES=("default" "claude" "git" "mode" "flush" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "代理策略控制" "原则" "AI CLI 专属代理，浏览器保留规则代理" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      default) panel_default_proxy ;;
+      claude) panel_claude ;;
+      git) panel_git ;;
+      mode)
+        MENU_LABELS=("rule" "global" "direct" "返回")
+        MENU_VALUES=("rule" "global" "direct" "back")
+        choose_menu "选择代理模式" "当前控制器" "$CONTROLLER" || true
+        if ! menu_is_back "$MENU_SELECTION" && [[ "$MENU_SELECTION" != "back" ]]; then
+          set_mode "$MENU_SELECTION"
+        fi
+        panel_pause
+        ;;
+      flush) flush_connections; panel_pause ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_service() {
+  local choice
+  while true; do
+    MENU_LABELS=("启动 Mihomo" "停止 Mihomo" "重启 Mihomo" "重新生成并热重载配置" "查看状态" "返回主菜单")
+    MENU_VALUES=("start" "stop" "restart" "reload" "status" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "服务控制" "配置" "$CONFIG_FILE" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      start) start_managed_mihomo; panel_pause ;;
+      stop) stop_mihomo; panel_pause ;;
+      restart) stop_mihomo; sleep 1; start_managed_mihomo; panel_pause ;;
+      reload) generate_config; reload_config; panel_pause ;;
+      status) panel_clear; show_status; panel_pause ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_diagnostics() {
+  local choice
+  while true; do
+    MENU_LABELS=("OpenAI 可用优先检测" "OpenAI 逐机场检测" "所有机场延迟检测" "查看日志路径" "返回主菜单")
+    MENU_VALUES=("openai_all" "openai_each" "delay_all" "log_path" "back")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "日志与诊断" "OpenAI 检测" "$OPENAI_TEST_URL" || return $?
+    choice="$MENU_SELECTION"
+    menu_is_back "$choice" && return 0
+
+    case "$choice" in
+      openai_all) panel_clear; run_openai_test all "$OPENAI_TEST_TIMEOUT_DEFAULT" "$DELAY_JOBS_DEFAULT"; panel_pause ;;
+      openai_each) panel_clear; run_openai_test each "$OPENAI_TEST_TIMEOUT_DEFAULT" "$DELAY_JOBS_DEFAULT"; panel_pause ;;
+      delay_all) panel_clear; delay_all_airports "$DELAY_URL_DEFAULT" "$DELAY_TIMEOUT_DEFAULT" "$DELAY_JOBS_DEFAULT"; panel_pause ;;
+      log_path)
+        panel_clear
+        ui_title "日志"
+        ui_kv "Mihomo 日志" "$BASE_DIR/mihomo.log"
+        ui_kv "控制器" "$CONTROLLER"
+        ui_info "实时查看仍可使用: mhswitch log"
+        ui_end
+        panel_pause
+        ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+panel_main() {
+  panel_require_tty || return 1
+
+  local choice openai_now
+  while true; do
+    openai_now="-"
+    if controller_alive; then
+      openai_now="$(curl_api GET "/proxies/OpenAI" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+    fi
+    MENU_LABELS=("状态总览" "OpenAI/Codex 控制" "机场管理" "代理策略控制" "服务控制" "日志与诊断" "退出")
+    MENU_VALUES=("status" "openai" "airports" "proxy" "service" "diagnostics" "quit")
+    MENU_SELECTION=""
+    MENU_SELECTION_LABEL=""
+    choose_menu "mhswitch 控制面板" "OpenAI/Codex" "$openai_now" || return $?
+    choice="$MENU_SELECTION"
+    if menu_is_back "$choice"; then
+      panel_clear
+      ui_ok "已退出 mhswitch 控制面板"
+      return 0
+    fi
+
+    case "$choice" in
+      status) panel_clear; show_status; panel_pause ;;
+      openai) panel_openai ;;
+      airports) panel_airports ;;
+      proxy) panel_proxy ;;
+      service) panel_service ;;
+      diagnostics) panel_diagnostics ;;
+      quit) panel_clear; ui_ok "已退出 mhswitch 控制面板"; return 0 ;;
+    esac
+  done
+}
+
+# ----------------- Latency Test -----------------
+delay_test_group() {
+  local group="$1"
+  local test_url="${2:-$DELAY_URL_DEFAULT}"
+  local timeout_ms="${3:-$DELAY_TIMEOUT_DEFAULT}"
+  local jobs="${4:-$DELAY_JOBS_DEFAULT}"
+
+  if ! controller_alive; then
+    ui_error "Mihomo 未运行"
+    ui_info "请先执行: mhswitch start"
+    return 1
+  fi
+
+  python3 - "$CONTROLLER" "$SECRET" "$group" "$test_url" "$timeout_ms" "$jobs" <<'PY'
+import concurrent.futures
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+controller, secret, group, test_url, timeout_ms, jobs = sys.argv[1:7]
+timeout_ms = int(timeout_ms)
+jobs = max(1, int(jobs))
+
+headers = {}
+if secret:
+    headers['Authorization'] = f'Bearer {secret}'
+
+def api_get(path, timeout=None):
+    url = controller.rstrip('/') + path
+    req = urllib.request.Request(url, headers=headers, method='GET')
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode('utf-8', errors='replace')
+    return json.loads(raw) if raw else {}
+
+def safe_get_group(g):
+    try:
+        return api_get('/proxies/' + urllib.parse.quote(g, safe=''), timeout=10)
+    except urllib.error.HTTPError as e:
+        sys.exit(f'读取策略组失败: {g}，HTTP {e.code}')
+    except Exception as e:
+        sys.exit(f'读取策略组失败: {g}，{e}')
+
+info = safe_get_group(group)
+nodes = info.get('all') or []
+
+if not nodes:
+    nodes = [group]
+
+skip = {'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS'}
+seen = set()
+clean_nodes = []
+for n in nodes:
+    if n in skip or n in seen:
+        continue
+    seen.add(n)
+    clean_nodes.append(n)
+
+if not clean_nodes:
+    print(f'策略组 [{group}] 中没有可检测节点。')
+    sys.exit(0)
+
+print(f'正在检测 [{group}]，节点数: {len(clean_nodes)}，测试地址: {test_url}，超时: {timeout_ms}ms，并发: {jobs}')
+
+def test_one(node):
+    path = (
+        '/proxies/' + urllib.parse.quote(node, safe='') +
+        '/delay?timeout=' + str(timeout_ms) +
+        '&url=' + urllib.parse.quote(test_url, safe='')
+    )
+    started = time.time()
+    try:
+        data = api_get(path, timeout=timeout_ms / 1000 + 5)
+        delay = data.get('delay')
+        if isinstance(delay, int) and delay >= 0:
+            return {'node': node, 'delay': delay, 'ok': True, 'error': ''}
+        return {'node': node, 'delay': None, 'ok': False, 'error': data.get('message') or 'no delay'}
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        msg = str(e).replace('\n', ' ')[:80]
+        return {'node': node, 'delay': None, 'ok': False, 'error': msg or f'timeout>{elapsed}ms'}
+
+results = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+    futures = [ex.submit(test_one, n) for n in clean_nodes]
+    for fut in concurrent.futures.as_completed(futures):
+        results.append(fut.result())
+
+results.sort(key=lambda x: (not x['ok'], x['delay'] if x['delay'] is not None else 10**9, x['node']))
+
+node_width = max(4, min(64, max(len(r['node']) for r in results)))
+print('-' * (node_width + 24))
+print(f"{'延迟(ms)':>10}  {'状态':<6}  {'节点':<{node_width}}")
+print('-' * (node_width + 24))
+for r in results:
+    if r['ok']:
+        delay_text = str(r['delay'])
+        status = 'OK'
+    else:
+        delay_text = '-'
+        status = 'FAIL'
+    name = r['node']
+    if len(name) > node_width:
+        name = name[:node_width - 1] + '…'
+    print(f"{delay_text:>10}  {status:<6}  {name:<{node_width}}")
+
+ok = [r for r in results if r['ok']]
+fail = len(results) - len(ok)
+print('-' * (node_width + 24))
+if ok:
+    best = ok[0]
+    print(f"最快节点: {best['node']} ({best['delay']} ms)")
+print(f"可用: {len(ok)} / {len(results)}，失败: {fail}")
+PY
+}
+
+delay_all_airports() {
+  local test_url="${1:-$DELAY_URL_DEFAULT}"
+  local timeout_ms="${2:-$DELAY_TIMEOUT_DEFAULT}"
+  local jobs="${3:-$DELAY_JOBS_DEFAULT}"
+  local count=0
+
+  while IFS=$'\t' read -r id name url exclude; do
+    [[ -s "$(provider_abs "$id")" ]] || continue
+    count=$((count + 1))
+    ui_section "机场: $name"
+    delay_test_group "${name}-手动" "$test_url" "$timeout_ms" "$jobs" || true
+  done < <(state_iter)
+
+  if [[ $count -eq 0 ]]; then
+    ui_warn "没有可检测的机场"
+    ui_info "请先执行: mhswitch add <订阅URL> [名称]"
+  fi
+}
+
+run_delay() {
+  local target="${1:-all}"
+  local test_url="${2:-$DELAY_URL_DEFAULT}"
+  local timeout_ms="${3:-$DELAY_TIMEOUT_DEFAULT}"
+  local jobs="${4:-$DELAY_JOBS_DEFAULT}"
+  local id name group
+
+  if [[ "$target" == "all" || "$target" == "全部" ]]; then
+    delay_all_airports "$test_url" "$timeout_ms" "$jobs"
+    return 0
+  fi
+
+  if id="$(resolve_id "$target" 2>/dev/null)"; then
+    name="$(airport_name_by_id "$id")"
+    group="${name}-手动"
+    delay_test_group "$group" "$test_url" "$timeout_ms" "$jobs"
+    return 0
+  fi
+
+  delay_test_group "$target" "$test_url" "$timeout_ms" "$jobs"
+}
+
+run_openai_test() {
+  local target="${1:-all}"
+  local timeout_ms="${2:-$OPENAI_TEST_TIMEOUT_DEFAULT}"
+  local jobs="${3:-$DELAY_JOBS_DEFAULT}"
+  local id name group count=0
+
+  ui_title "OpenAI 网站支持检测"
+  ui_kv "固定地区" "$AI_REGION_NAME"
+  ui_kv "测试地址" "$OPENAI_TEST_URL"
+  ui_end
+
+  case "$target" in
+    all|best|auto|全部|最优|"")
+      group="$OPENAI_AUTO_GROUP"
+      delay_test_group "$group" "$OPENAI_TEST_URL" "$timeout_ms" "$jobs"
+      return 0
+      ;;
+    strict|region|fixed|固定|固定地区)
+      group="OpenAI-${AI_REGION_NAME}-最优"
+      delay_test_group "$group" "$OPENAI_TEST_URL" "$timeout_ms" "$jobs"
+      return 0
+      ;;
+    global|any|all-region|全局|全地区)
+      group="$OPENAI_GLOBAL_GROUP"
+      delay_test_group "$group" "$OPENAI_TEST_URL" "$timeout_ms" "$jobs"
+      return 0
+      ;;
+    each|airports|逐机场|机场)
+      while IFS=$'\t' read -r id name url exclude; do
+        [[ -s "$(provider_abs "$id")" ]] || continue
+        count=$((count + 1))
+        ui_section "机场: $name"
+        delay_test_group "OpenAI-${name}-${AI_REGION_NAME}" "$OPENAI_TEST_URL" "$timeout_ms" "$jobs" || true
+      done < <(state_iter)
+      if [[ $count -eq 0 ]]; then
+        ui_warn "没有可检测的机场"
+        ui_info "请先执行: mhswitch add <订阅URL> [名称]"
+      fi
+      return 0
+      ;;
+    *)
+      if id="$(resolve_id "$target" 2>/dev/null)"; then
+        name="$(airport_name_by_id "$id")"
+        group="OpenAI-${name}-${AI_REGION_NAME}"
+      else
+        group="$target"
+      fi
+      delay_test_group "$group" "$OPENAI_TEST_URL" "$timeout_ms" "$jobs"
+      ;;
+  esac
+}
+
+# ----------------- VPN Control Commands -----------------
+set_group_proxy() {
+  local group="$1" target="$2"
+  if ! controller_alive; then
+    ui_error "Mihomo 未运行"
+    return 1
+  fi
+  curl_api PUT "/proxies/$(urlenc "$group")" -H 'Content-Type: application/json' -d "{\"name\":$(json_quote "$target")}" >/dev/null
+  ui_ok "策略已切换"
+  ui_kv_arrow "$group" "$target"
+}
+
+set_mode() {
+  local mode="$1"
+  mode="$(echo "$mode" | tr '[:upper:]' '[:lower:]')"
+  [[ "$mode" =~ ^(rule|global|direct)$ ]] || { ui_error "模式必须是 rule、global 或 direct"; return 1; }
+  if ! controller_alive; then
+    ui_error "Mihomo 未运行"
+    return 1
+  fi
+  curl_api PATCH "/configs" -H 'Content-Type: application/json' -d "{\"mode\":\"$mode\"}" >/dev/null
+  ui_ok "代理模式已切换"
+  ui_kv "模式" "$mode"
+}
+
+flush_connections() {
+  if ! controller_alive; then
+    ui_error "Mihomo 未运行"
+    return 1
+  fi
+  curl_api DELETE "/connections" >/dev/null
+  ui_ok "已切断所有现有连接"
+}
+
+show_git_clone_proxy() {
+  local now="-"
+  if controller_alive; then
+    now="$(curl_api GET "/proxies/$(urlenc "$GIT_GROUP_NAME")" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+  fi
+  ui_title "Git Clone 代理"
+  ui_kv_arrow "$GIT_GROUP_NAME" "$now"
+  ui_end
+}
+
+set_git_clone_proxy() {
+  local arg="${1:-status}"
+  local target=""
+  local id=""
+  local name=""
+
+  case "$arg" in
+    status|状态)
+      show_git_clone_proxy
+      return 0
+      ;;
+    direct|off|no|false|0|直连)
+      target="DIRECT"
+      ;;
+    proxy|on|yes|true|1|代理)
+      target="默认代理"
+      ;;
+    best|auto|all|全部|最优)
+      target="最优节点"
+      ;;
+    *)
+      if id="$(resolve_id "$arg" 2>/dev/null)"; then
+        name="$(airport_name_by_id "$id")"
+        target="${name}-自动"
+      else
+        target="$arg"
+      fi
+      ;;
+  esac
+
+  set_group_proxy "$GIT_GROUP_NAME" "$target"
+}
+
+show_status() {
+  local mode="unknown"
+  local default_now="-"
+  local claude_now="-"
+  local openai_now="-"
+  local git_now="-"
+  local version="-"
+  local service="❌ 未运行"
+
+  if controller_alive; then
+    service="✅ 运行中"
+    mode="$(curl_api GET "/configs" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mode', 'unknown'))" 2>/dev/null || echo "unknown")"
+    version="$(curl_api GET "/version" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version') or d.get('meta') or '-')" 2>/dev/null || echo "-")"
+    default_now="$(curl_api GET "/proxies/默认代理" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+    claude_now="$(curl_api GET "/proxies/Claude" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+    openai_now="$(curl_api GET "/proxies/OpenAI" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+    git_now="$(curl_api GET "/proxies/$(urlenc "$GIT_GROUP_NAME")" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+  fi
+
+  local airport_count=0
+  local airports_text=""
+  while IFS=$'\t' read -r id name url exclude; do
+    airport_count=$((airport_count + 1))
+    airports_text+="  $airport_count. $name
+"
+  done < <(state_iter)
+  [[ $airport_count -eq 0 ]] && airports_text="  (无)
+"
+
+  ui_title "mhswitch 状态"
+  ui_kv "服务" "$service"
+  ui_kv "控制器" "$CONTROLLER"
+  ui_kv "模式" "$mode"
+  ui_kv "版本" "$version"
+  ui_kv "配置" "$CONFIG_FILE"
+  ui_kv "AI 固定地区" "$AI_REGION_NAME"
+  ui_kv "OpenAI 检测地址" "$OPENAI_TEST_URL"
+  ui_kv "OpenAI 检测超时" "${OPENAI_TEST_TIMEOUT_DEFAULT}ms"
+  ui_kv "AI 额外排除" "${AI_EXCLUDE_FILTER:-(无)}"
+  ui_kv "故障检查间隔" "${FAILOVER_INTERVAL_DEFAULT}s"
+  ui_kv "故障超时阈值" "${FAILOVER_TIMEOUT_DEFAULT}ms"
+  ui_end
+
+  ui_title "当前策略"
+  ui_kv_arrow "默认代理" "$default_now"
+  ui_kv_arrow "Claude" "$claude_now"
+  ui_kv_arrow "OpenAI/Codex" "$openai_now"
+  ui_kv_arrow "Git Clone" "$git_now"
+  ui_end
+
+  ui_title "已配置机场: ${airport_count} 个"
+  printf "%s" "$airports_text"
+  ui_end
+
+  echo
+  if ! controller_alive; then
+    echo "提示: 可使用 mhswitch start 启动 Mihomo。"
+  else
+    echo "常用: mhswitch openai-test  检测 OpenAI 支持    mhswitch openai best  Codex 地区优先+兜底"
+  fi
+}
+
+show_help() {
+  cat <<EOF
+mhswitch - Mihomo 多订阅切换工具
+
+用法:
+  mhswitch <命令> [参数]
+  mhswitch                       交互终端下打开控制面板；非交互下显示 status
+
+机场管理:
+  add <url> [name]              添加机场订阅，可省略 name 自动识别
+  remove <name>                 删除指定机场，支持名称/别名
+  list                          查看状态与机场列表
+  nodes [all|机场名]            查看所有机场或指定机场的具体节点
+  update                        更新所有机场订阅
+
+代理控制:
+  proxy <name> [auto|manual]    切换备用默认代理组；当前规则下普通软件默认直连
+  claude [best|机场名]          Claude 固定 ${AI_REGION_NAME} 地区；best=所有机场同地区故障切换
+  openai [select|best|strict|global|direct|机场名 [auto|strict|global]]
+                                OpenAI/Codex；交互终端下省略参数会先选机场，再选规则
+                                select=上下键两步选择；best=全部机场 ${AI_REGION_NAME} 优先+全地区兜底
+                                strict=全部机场仅固定地区；global=全部机场全地区 OpenAI 检测组
+                                机场名后可接 auto/strict/global，默认 strict 保持兼容
+  codex [select|best|strict|global|direct|机场名 [auto|strict|global]]
+                                openai 的别名
+  git [direct|proxy|best|机场名|策略组名]
+                                仅保留兼容；当前规则下 Git 托管域名固定直连
+  mode <rule|global|direct>     更改代理模式
+  flush                         切断当前所有连接
+
+节点检测:
+  delay [all|机场名|策略组名] [url] [timeout_ms]
+                                检测节点延迟并按速度排序，仅用于手动查看，不影响自动故障切换
+  openai-test [all|strict|global|each|机场名|策略组名] [timeout_ms] [jobs]
+                                检测节点是否支持 OpenAI/ChatGPT 网站
+                                all=可用优先组；strict=固定地区组；global=全地区组；each=逐机场固定地区检测
+  chatgpt-test ...              openai-test 的别名
+  latency ...                   delay 的别名
+  test ...                      delay 的别名
+
+核心服务:
+  panel | ui | menu              打开终端控制面板
+  install                       检测并安装 Mihomo 官方稳定版
+  start                         自动安装（如缺失）并后台启动 Mihomo
+                                首次启动且没有机场时会提示输入订阅链接
+  stop                          停止 Mihomo
+  restart                       重启并重新加载配置
+  reload                        重新生成并热重载配置，不更新订阅
+  log                           查看 Mihomo 后台日志
+  status                        查看运行状态与当前策略
+
+示例:
+  mhswitch panel                # 打开控制面板
+  mhswitch add "https://sub.url/..." "独角兽"
+  mhswitch nodes                # 查看所有机场的具体节点
+  mhswitch nodes XFLTD          # 只查看 XFLTD 的具体节点
+  mhswitch proxy 独角兽 auto
+  mhswitch claude best          # Claude 在所有机场的 ${AI_REGION_NAME} 节点中故障切换
+  mhswitch claude XFLTD         # Claude 固定 XFLTD 机场的 ${AI_REGION_NAME} 节点故障切换
+  mhswitch openai               # 交互终端下先选机场，再选规则
+  mhswitch openai select        # 显式打开两步选择
+  mhswitch openai best          # OpenAI/Codex ${AI_REGION_NAME} 优先，失败时自动全地区兜底
+  mhswitch openai strict        # OpenAI/Codex 仅固定 ${AI_REGION_NAME} 地区故障切换
+  mhswitch openai global        # OpenAI/Codex 使用所有地区 OpenAI 检测组
+  mhswitch openai XFLTD         # 兼容旧用法：固定 XFLTD 机场的 ${AI_REGION_NAME} 节点故障切换
+  mhswitch openai XFLTD auto    # XFLTD 机场内 ${AI_REGION_NAME} 优先，失败时退到该机场全地区
+  mhswitch openai XFLTD global  # XFLTD 机场内全地区 OpenAI 检测组
+  mhswitch openai-test          # 检测 OpenAI 可用优先组
+  mhswitch openai-test strict   # 检测所有机场 ${AI_REGION_NAME} OpenAI 候选节点
+  mhswitch openai-test each     # 逐机场检测 ${AI_REGION_NAME} OpenAI 候选节点
+  mhswitch git direct           # 当前规则下 Git 托管域名固定直连
+  mhswitch delay all
+  mhswitch mode global
+
+环境变量:
+  MHSWITCH_AI_REGION_NAME       AI 固定地区名称，默认: 美国
+  MHSWITCH_AI_REGION_FILTER     AI 地区节点过滤正则，默认匹配美国节点
+  MHSWITCH_AI_EXCLUDE_FILTER    AI 节点额外排除正则，默认排除 DRT/MIX；设为空字符串可关闭
+  MHSWITCH_OPENAI_TEST_URL      OpenAI/Codex 地区组健康检查地址，默认: https://chatgpt.com/cdn-cgi/trace
+  MHSWITCH_OPENAI_TEST_TIMEOUT  OpenAI/Codex 地区组健康检查超时，默认 10000
+  MHSWITCH_CLAUDE_TEST_URL      Claude 地区组健康检查地址，默认: https://claude.ai
+  MHSWITCH_DELAY_URL            手动测速默认地址
+  MHSWITCH_DELAY_TIMEOUT        手动测速超时，单位毫秒，默认 5000
+  MHSWITCH_DELAY_JOBS           手动测速并发数，默认 12
+  MHSWITCH_FAILOVER_INTERVAL    故障切换健康检查间隔，单位秒，默认 300
+  MHSWITCH_FAILOVER_TIMEOUT     健康检查超时时间，单位毫秒，默认 5000；只有超时才认为节点不可用
+  MHSWITCH_FAILOVER_LAZY        是否懒检查，默认 false；false 表示定时主动检查
+  MHSWITCH_GIT_PROXY_DEFAULT    Git Clone 默认策略，默认: direct，可选 direct/proxy/best
+  MHSWITCH_GIT_GROUP_NAME       Git Clone 策略组名，默认: Git Clone
+  MHSWITCH_MIHOMO_INSTALL_DIR   Mihomo 安装目录，默认: ~/.local/bin
+  MHSWITCH_MIHOMO_VERSION       指定要安装的稳定版本，例如: v1.19.29
+  MHSWITCH_NO_EMOJI=1           禁用 emoji 图标
+EOF
+}
+
+# ----------------- Command Dispatcher -----------------
+init_state
+if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
+  cmd="panel"
+else
+  cmd="${1:-status}"
+fi
+
+case "$cmd" in
+  panel|ui|menu|控制面板)
+    panel_main
+    ;;
+
+  status) show_status ;;
+  list) show_status ;;
+
+  add)
+    [[ $# -ge 2 ]] || { ui_error "用法: mhswitch add <URL> [自定义名称]"; exit 1; }
+    add_airport "$2" "${3:-}"
+    ;;
+
+  remove)
+    [[ $# -ge 2 ]] || { ui_error "用法: mhswitch remove <机场名>"; exit 1; }
+    id="$(resolve_id "$2")" || { ui_error "未找到机场: $2"; exit 1; }
+    state_remove "$id"
+    generate_config && reload_config
+    ui_ok "机场已删除"
+    ui_kv "机场" "$2"
+    ;;
+
+  update)
+    refresh_all
+    ;;
+
+  nodes|node-list|list-nodes|机场节点)
+    list_nodes "${2:-all}"
+    ;;
+
+  proxy)
+    [[ $# -ge 2 ]] || { ui_error "用法: mhswitch proxy <机场名> [auto|manual]"; exit 1; }
+    id="$(resolve_id "$2")" || { ui_error "未找到机场: $2"; exit 1; }
+    name="$(state_iter | grep "^$id" | cut -f2)"
+    mode="${3:-auto}"
+    case "$mode" in
+      auto|自动) target="${name}-自动" ;;
+      manual|手动) target="${name}-手动" ;;
+      *) ui_error "第二个参数必须是 auto 或 manual"; exit 1 ;;
+    esac
+    set_group_proxy "默认代理" "$target"
+    ;;
+
+  claude)
+    target_arg="${2:-best}"
+    case "$target_arg" in
+      best|auto|all|全部|最优)
+        set_group_proxy "Claude" "Claude-${AI_REGION_NAME}-最优"
+        ;;
+      *)
+        id="$(resolve_id "$target_arg")" || { ui_error "未找到机场: $target_arg"; exit 1; }
+        name="$(state_iter | grep "^$id" | cut -f2)"
+        set_group_proxy "Claude" "Claude-${name}-${AI_REGION_NAME}"
+        ;;
+    esac
+    ;;
+
+  openai|codex)
+    target_arg="${2:-}"
+    rule_arg="${3:-}"
+    if [[ -z "$target_arg" ]]; then
+      if is_interactive_tty; then
+        OPENAI_TARGET_SELECTION=""
+        choose_openai_target_interactive || exit $?
+        set_group_proxy "OpenAI" "$OPENAI_TARGET_SELECTION"
+      else
+        set_group_proxy "OpenAI" "$OPENAI_AUTO_GROUP"
+      fi
+      exit $?
+    fi
+
+    case "$target_arg" in
+      select|choose|pick|menu|选择|机场)
+        OPENAI_TARGET_SELECTION=""
+        choose_openai_target_interactive || exit $?
+        set_group_proxy "OpenAI" "$OPENAI_TARGET_SELECTION"
+        ;;
+      best|auto|all|全部|最优)
+        set_group_proxy "OpenAI" "$OPENAI_AUTO_GROUP"
+        ;;
+      strict|region|fixed|固定|固定地区)
+        set_group_proxy "OpenAI" "OpenAI-${AI_REGION_NAME}-最优"
+        ;;
+      global|any|all-region|全局|全地区)
+        set_group_proxy "OpenAI" "$OPENAI_GLOBAL_GROUP"
+        ;;
+      direct|DIRECT|直连)
+        set_group_proxy "OpenAI" "DIRECT"
+        ;;
+      *)
+        id="$(resolve_id "$target_arg")" || { ui_error "未找到机场: $target_arg"; exit 1; }
+        name="$(state_iter | grep "^$id" | cut -f2)"
+        case "$rule_arg" in
+          ""|strict|region|fixed|固定|固定地区)
+            set_group_proxy "OpenAI" "OpenAI-${name}-${AI_REGION_NAME}"
+            ;;
+          auto|best|优先|可用优先|兜底|最优)
+            set_group_proxy "OpenAI" "OpenAI-${name}-可用优先"
+            ;;
+          global|any|all-region|全局|全地区)
+            set_group_proxy "OpenAI" "OpenAI-${name}-全地区-最优"
+            ;;
+          direct|DIRECT|直连)
+            set_group_proxy "OpenAI" "DIRECT"
+            ;;
+          *)
+            ui_error "机场后的规则必须是 auto、strict、global 或 direct"
+            exit 1
+            ;;
+        esac
+        ;;
+    esac
+    ;;
+
+  mode)
+    [[ $# -ge 2 ]] || { ui_error "用法: mhswitch mode <rule|global|direct>"; exit 1; }
+    set_mode "$2"
+    ;;
+
+  flush)
+    flush_connections
+    ;;
+
+  git|git-clone)
+    set_git_clone_proxy "${2:-status}"
+    ;;
+
+  delay|latency|test)
+    run_delay "${2:-all}" "${3:-$DELAY_URL_DEFAULT}" "${4:-$DELAY_TIMEOUT_DEFAULT}" "${5:-$DELAY_JOBS_DEFAULT}"
+    ;;
+
+  openai-test|chatgpt-test)
+    run_openai_test "${2:-all}" "${3:-$OPENAI_TEST_TIMEOUT_DEFAULT}" "${4:-$DELAY_JOBS_DEFAULT}"
+    ;;
+
+  install)
+    if bin="$(find_mihomo_bin 2>/dev/null)" && mihomo_binary_works "$bin"; then
+      ui_ok "Mihomo 已正确安装"
+      ui_kv "程序" "$bin"
+      ui_kv "版本" "$("$bin" -v 2>/dev/null | head -n 1)"
+    else
+      install_mihomo
+    fi
+    ;;
+
+  start)
+    start_managed_mihomo
+    ;;
+
+  stop)
+    stop_mihomo
+    ;;
+
+  restart)
+    ui_title "重启 Mihomo"
+    stop_mihomo
+    sleep 1
+    start_managed_mihomo
+    ui_end
+    ;;
+
+  reload)
+    generate_config
+    reload_config
+    ;;
+
+  log)
+    if [[ -f "$BASE_DIR/mihomo.log" ]]; then
+      ui_info "查看日志: $BASE_DIR/mihomo.log"
+      tail -f "$BASE_DIR/mihomo.log"
+    else
+      ui_warn "暂无日志文件"
+    fi
+    ;;
+
+  -h|--help|help)
+    show_help
+    ;;
+
+  *)
+    ui_error "未知命令: $cmd"
+    show_help
+    exit 1
+    ;;
+esac
