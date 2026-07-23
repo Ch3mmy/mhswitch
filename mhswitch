@@ -213,22 +213,32 @@ choose_menu() {
   local title="$1"
   local context_label="${2:-}"
   local context_value="${3:-}"
+  local context_label_2="${4:-}"
+  local context_value_2="${5:-}"
   local idx=0
   local key rest
+
+  if [[ ${#MENU_LABELS[@]} -eq 0 ]]; then
+    ui_warn "当前没有可选项目"
+    return 1
+  fi
 
   while true; do
     printf '\033[2J\033[H'
     ui_title "$title"
     [[ -n "$context_label" ]] && ui_kv "$context_label" "$context_value"
-    ui_kv "操作" "↑/↓ 或 k/j 移动，Enter 进入，Esc/q 返回"
+    [[ -n "$context_label_2" ]] && ui_kv "$context_label_2" "$context_value_2"
+    ui_kv "操作" "↑/↓ 或 k/j 移动，1-9 快选，Enter 确认，Esc/q 返回"
     ui_end
     echo
 
     for i in "${!MENU_LABELS[@]}"; do
+      local shortcut=" "
+      (( i < 9 )) && shortcut="$((i + 1))"
       if (( i == idx )); then
-        printf '  > %s\n' "${MENU_LABELS[$i]}"
+        printf '  > [%s] %s\n' "$shortcut" "${MENU_LABELS[$i]}"
       else
-        printf '    %s\n' "${MENU_LABELS[$i]}"
+        printf '    [%s] %s\n' "$shortcut" "${MENU_LABELS[$i]}"
       fi
     done
 
@@ -259,6 +269,14 @@ choose_menu() {
         ;;
       j|J)
         idx=$(( (idx + 1) % ${#MENU_LABELS[@]} ))
+        ;;
+      [1-9])
+        local selected_idx=$((10#$key - 1))
+        if (( selected_idx < ${#MENU_LABELS[@]} )); then
+          MENU_SELECTION="${MENU_VALUES[$selected_idx]}"
+          MENU_SELECTION_LABEL="${MENU_LABELS[$selected_idx]}"
+          return 0
+        fi
         ;;
       q|Q)
         MENU_SELECTION="$MENU_BACK"
@@ -541,7 +559,8 @@ first_run_setup() {
   ui_end
 
   local url
-  url="$(panel_prompt "机场订阅 URL")" || return 1
+  panel_prompt_subscription "机场订阅 URL" || return 1
+  url="$PANEL_SUBSCRIPTION_URL"
   if [[ -z "$url" ]]; then
     ui_warn "已跳过机场配置，将以直连模式启动"
     return 0
@@ -1234,7 +1253,7 @@ panel_clear() {
 panel_pause() {
   is_interactive_tty || return 0
   echo
-  read -rsn1 -p "按任意键返回控制面板..." _ || true
+  read -rsn1 -p "按任意键继续..." _ || true
   echo
 }
 
@@ -1267,6 +1286,49 @@ panel_confirm() {
     y|Y|yes|YES|Yes|是|确认) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+subscription_source_valid() {
+  local src="${1:-}"
+  src="${src/#\~/$HOME}"
+  [[ "$src" =~ ^https?:// || "$src" =~ ^file:// || -f "$src" ]]
+}
+
+panel_prompt_subscription() {
+  local prompt="${1:-订阅 URL}"
+  local value=""
+  while true; do
+    value="$(panel_prompt "$prompt")" || return 1
+    if [[ -z "$value" ]]; then
+      PANEL_SUBSCRIPTION_URL=""
+      return 0
+    fi
+    if subscription_source_valid "$value"; then
+      PANEL_SUBSCRIPTION_URL="$value"
+      return 0
+    fi
+    ui_warn "请输入 http(s) 订阅 URL、file:// URL 或已有的本地文件"
+  done
+}
+
+panel_runtime_snapshot() {
+  PANEL_SERVICE_STATUS="未运行"
+  PANEL_MODE_STATUS="-"
+  PANEL_OPENAI_STATUS="-"
+  PANEL_VERSION_STATUS="-"
+  PANEL_AIRPORT_COUNT=0
+
+  local id name url exclude
+  while IFS=$'\t' read -r id name url exclude; do
+    [[ -n "$id" ]] && PANEL_AIRPORT_COUNT=$((PANEL_AIRPORT_COUNT + 1))
+  done < <(state_iter)
+
+  if controller_alive; then
+    PANEL_SERVICE_STATUS="运行中"
+    PANEL_MODE_STATUS="$(curl_api GET "/configs" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mode', '-'))" 2>/dev/null || echo "读取失败")"
+    PANEL_OPENAI_STATUS="$(curl_api GET "/proxies/OpenAI" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
+    PANEL_VERSION_STATUS="$(curl_api GET "/version" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version') or d.get('meta') or '-')" 2>/dev/null || echo "读取失败")"
+  fi
 }
 
 panel_select_airport() {
@@ -1303,7 +1365,8 @@ panel_add_airport() {
   echo
 
   local url name
-  url="$(panel_prompt "订阅 URL")" || return 1
+  panel_prompt_subscription "订阅 URL" || return 1
+  url="$PANEL_SUBSCRIPTION_URL"
   if [[ -z "$url" ]]; then
     ui_warn "已取消：订阅 URL 为空"
     return 0
@@ -1314,7 +1377,7 @@ panel_add_airport() {
 
 panel_remove_airport() {
   local id name
-  panel_select_airport "选择要删除的机场" || return 0
+  panel_select_airport "选择要删除的机场" || return 1
   id="$PANEL_AIRPORT_ID"
   name="$PANEL_AIRPORT_NAME"
 
@@ -1331,32 +1394,42 @@ panel_remove_airport() {
     ui_ok "机场已删除"
     ui_kv "机场" "$name"
   else
-    ui_warn "已取消删除"
+    return 1
   fi
 }
 
 panel_airport_nodes_one() {
-  panel_select_airport "选择要查看节点的机场" || return 0
+  panel_select_airport "选择要查看节点的机场" || return 1
   list_nodes "$PANEL_AIRPORT_NAME"
 }
 
 panel_airports() {
   local choice
   while true; do
+    panel_runtime_snapshot
     MENU_LABELS=("新增机场" "删除机场" "更新所有订阅" "查看所有机场节点" "查看指定机场节点" "返回主菜单")
     MENU_VALUES=("add" "remove" "update" "nodes_all" "nodes_one" "back")
     MENU_SELECTION=""
     MENU_SELECTION_LABEL=""
-    choose_menu "机场管理" "状态文件" "$STATE_FILE" || return $?
+    choose_menu "机场管理" "已配置机场" "${PANEL_AIRPORT_COUNT} 个" || return $?
     choice="$MENU_SELECTION"
     menu_is_back "$choice" && return 0
 
     case "$choice" in
       add) panel_add_airport; panel_pause ;;
-      remove) panel_remove_airport; panel_pause ;;
+      remove)
+        if panel_remove_airport; then
+          panel_pause
+        fi
+        ;;
       update) refresh_all; panel_pause ;;
       nodes_all) panel_clear; list_nodes all; panel_pause ;;
-      nodes_one) panel_clear; panel_airport_nodes_one; panel_pause ;;
+      nodes_one)
+        panel_clear
+        if panel_airport_nodes_one; then
+          panel_pause
+        fi
+        ;;
       back) return 0 ;;
     esac
   done
@@ -1365,11 +1438,12 @@ panel_airports() {
 panel_openai() {
   local choice
   while true; do
+    panel_runtime_snapshot
     MENU_LABELS=("选择 OpenAI/Codex 机场和规则" "检测可用优先组" "逐机场检测 OpenAI" "查看当前策略" "返回主菜单")
     MENU_VALUES=("select" "test_all" "test_each" "status" "back")
     MENU_SELECTION=""
     MENU_SELECTION_LABEL=""
-    choose_menu "OpenAI/Codex 控制" "固定地区" "$AI_REGION_NAME" || return $?
+    choose_menu "OpenAI/Codex 控制" "当前策略" "$PANEL_OPENAI_STATUS" "固定地区" "$AI_REGION_NAME" || return $?
     choice="$MENU_SELECTION"
     menu_is_back "$choice" && return 0
 
@@ -1419,15 +1493,15 @@ panel_default_proxy() {
         if panel_select_airport "选择默认代理机场"; then
           id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
           set_group_proxy "默认代理" "${name}-自动"
+          panel_pause
         fi
-        panel_pause
         ;;
       airport_manual)
         if panel_select_airport "选择默认代理机场"; then
           id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
           set_group_proxy "默认代理" "${name}-手动"
+          panel_pause
         fi
-        panel_pause
         ;;
       back) return 0 ;;
     esac
@@ -1451,8 +1525,8 @@ panel_claude() {
         if panel_select_airport "选择 Claude 机场"; then
           id="$PANEL_AIRPORT_ID"; name="$(airport_name_by_id "$id")"
           set_group_proxy "Claude" "Claude-${name}-${AI_REGION_NAME}"
+          panel_pause
         fi
-        panel_pause
         ;;
       back) return 0 ;;
     esac
@@ -1478,8 +1552,8 @@ panel_git() {
       airport)
         if panel_select_airport "选择 Git Clone 机场"; then
           set_git_clone_proxy "$PANEL_AIRPORT_NAME"
+          panel_pause
         fi
-        panel_pause
         ;;
       back) return 0 ;;
     esac
@@ -1502,15 +1576,23 @@ panel_proxy() {
       claude) panel_claude ;;
       git) panel_git ;;
       mode)
-        MENU_LABELS=("rule" "global" "direct" "返回")
+        MENU_LABELS=("规则模式（推荐）" "全局代理" "全部直连" "返回")
         MENU_VALUES=("rule" "global" "direct" "back")
-        choose_menu "选择代理模式" "当前控制器" "$CONTROLLER" || true
-        if ! menu_is_back "$MENU_SELECTION" && [[ "$MENU_SELECTION" != "back" ]]; then
-          set_mode "$MENU_SELECTION"
+        MENU_SELECTION=""
+        MENU_SELECTION_LABEL=""
+        if choose_menu "选择代理模式" "当前控制器" "$CONTROLLER"; then
+          if ! menu_is_back "$MENU_SELECTION" && [[ "$MENU_SELECTION" != "back" ]]; then
+            set_mode "$MENU_SELECTION"
+            panel_pause
+          fi
         fi
-        panel_pause
         ;;
-      flush) flush_connections; panel_pause ;;
+      flush)
+        if panel_confirm "确认切断所有现有连接"; then
+          flush_connections
+          panel_pause
+        fi
+        ;;
       back) return 0 ;;
     esac
   done
@@ -1519,18 +1601,31 @@ panel_proxy() {
 panel_service() {
   local choice
   while true; do
+    panel_runtime_snapshot
     MENU_LABELS=("启动 Mihomo" "停止 Mihomo" "重启 Mihomo" "重新生成并热重载配置" "查看状态" "返回主菜单")
     MENU_VALUES=("start" "stop" "restart" "reload" "status" "back")
     MENU_SELECTION=""
     MENU_SELECTION_LABEL=""
-    choose_menu "服务控制" "配置" "$CONFIG_FILE" || return $?
+    choose_menu "服务控制" "服务" "$PANEL_SERVICE_STATUS" "Mihomo" "$PANEL_VERSION_STATUS" || return $?
     choice="$MENU_SELECTION"
     menu_is_back "$choice" && return 0
 
     case "$choice" in
       start) start_managed_mihomo; panel_pause ;;
-      stop) stop_mihomo; panel_pause ;;
-      restart) stop_mihomo; sleep 1; start_managed_mihomo; panel_pause ;;
+      stop)
+        if panel_confirm "确认停止 Mihomo"; then
+          stop_mihomo
+          panel_pause
+        fi
+        ;;
+      restart)
+        if panel_confirm "确认重启 Mihomo"; then
+          stop_mihomo
+          sleep 1
+          start_managed_mihomo
+          panel_pause
+        fi
+        ;;
       reload) generate_config; reload_config; panel_pause ;;
       status) panel_clear; show_status; panel_pause ;;
       back) return 0 ;;
@@ -1570,17 +1665,18 @@ panel_diagnostics() {
 panel_main() {
   panel_require_tty || return 1
 
-  local choice openai_now
+  local choice airport_label service_label
   while true; do
-    openai_now="-"
-    if controller_alive; then
-      openai_now="$(curl_api GET "/proxies/OpenAI" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('now') or '-')" 2>/dev/null || echo "读取失败")"
-    fi
-    MENU_LABELS=("状态总览" "OpenAI/Codex 控制" "机场管理" "代理策略控制" "服务控制" "日志与诊断" "退出")
+    panel_runtime_snapshot
+    airport_label="机场管理（${PANEL_AIRPORT_COUNT}）"
+    service_label="服务控制（${PANEL_SERVICE_STATUS}）"
+    MENU_LABELS=("状态总览" "OpenAI/Codex 控制" "$airport_label" "代理策略控制" "$service_label" "日志与诊断" "退出")
     MENU_VALUES=("status" "openai" "airports" "proxy" "service" "diagnostics" "quit")
     MENU_SELECTION=""
     MENU_SELECTION_LABEL=""
-    choose_menu "mhswitch 控制面板" "OpenAI/Codex" "$openai_now" || return $?
+    choose_menu "mhswitch 控制面板" \
+      "服务" "${PANEL_SERVICE_STATUS} · 模式 ${PANEL_MODE_STATUS} · 机场 ${PANEL_AIRPORT_COUNT}" \
+      "OpenAI/Codex" "$PANEL_OPENAI_STATUS" || return $?
     choice="$MENU_SELECTION"
     if menu_is_back "$choice"; then
       panel_clear
